@@ -1,276 +1,169 @@
 /*
-   Time_NTP.pde
-   Example showing time sync to NTP time source
+  ESP32 + Si5351 (Etherkit) WSPR Transmitter – 20 m band
+  -------------------------------------------------------
+  Generates a WSPR beacon directly on RF using the Etherkit Si5351 library.
 
-   This sketch uses the Ethernet library
+  Features:
+  - Native NTP time sync (no external RTC required)
+  - Precise 0.682687 s WSPR symbol timing using ESP32 hardware timer
+  - Optional 30 s warm-up for frequency stabilization
+  - Supports fine frequency correction in Hz
+
+  Author: EA2FGS - @coriumalpha
+  License: MIT
 */
 
-
-#include <JTEncode.h>
-#include <int.h>
-#include <TimeLib.h>
 #include <WiFi.h>
-#include <WiFiUdp.h>
+#include <time.h>
+#include <Wire.h>
+#include <JTEncode.h>
+#include <si5351.h>      // Etherkit Si5351 library
+#include <TimeLib.h>     // For minute(), second(), etc.
 
-#include <Adafruit_SI5351.h>
+// -------------------- User Configuration --------------------
+const char* ssid = "YOUR_WIFI_SSID";
+const char* pass = "YOUR_WIFI_PASSWORD";
 
-Adafruit_SI5351 clockgen = Adafruit_SI5351();
+char   call[7] = "CALLSIGN";   // Your callsign (e.g., "EA2FGS")
+char   loc[5]  = "GRID";       // Maidenhead locator (e.g., "IN83")
+uint8_t dbm    = 10;           // Transmit power (dBm) reported in WSPR payload
 
-#define TONE_SPACING            1.46           // ~1.46 Hz
-#define WSPR_CTC                10672         // CTC value for WSPR
-#define SYMBOL_COUNT            WSPR_SYMBOL_COUNT
-#define CORRECTION              350            // Freq Correction in HZ
+// WSPR 20 m band: Dial frequency (USB mode)
+#define DIAL_20M_HZ     14097100UL     // 14.097100 MHz RF center
+#define CORRECTION_HZ   -2392          // Fine frequency correction (measured offset in Hz)
 
+// -------------------- WSPR Constants --------------------
+#define SYMBOL_COUNT      WSPR_SYMBOL_COUNT
+#define TONE_SPACING_CHZ  146          // 1.46 Hz tone spacing = 146 centi-Hz
+#define SYM_US            682687UL     // WSPR symbol duration = 0.682687 seconds
 
+// -------------------- Globals --------------------
+Si5351 si5351;
+JTEncode jt;
+uint8_t txbuf[SYMBOL_COUNT];
 
+hw_timer_t* tmr = nullptr;
+volatile bool tick = false;
+bool warmed_up = false;  // Tracks whether the Si5351 is pre-heated
 
+// -------------------- Timer ISR --------------------
+void IRAM_ATTR onTick() { tick = true; }
 
-hw_timer_t * timer = NULL;
+// -------------------- Time Setup (NTP) --------------------
+void setupTime() {
+  // Time zone: Central Europe (with daylight saving)
+  setenv("TZ", "CET-1CEST,M3.5.0/2,M10.5.0/3", 1);
+  tzset();
 
-// WiFi network name and password:
-const char * networkName = "xxxxxxxxxxx";
-const char * networkPswd = "xxxxxxxxxxx";
+  // Sync time from NTP servers
+  configTime(0, 0, "pool.ntp.org", "time.google.com", "europe.pool.ntp.org");
 
+  // Wait until time is valid (epoch > 8h)
+  for (int i = 0; i < 50 && time(nullptr) < 8 * 3600; i++) delay(200);
 
-JTEncode jtencode;
-unsigned long freq =  14097100UL + CORRECTION;              // Change this
-char call[7] = "NOCALL";                        // Change this
-char loc[5] = "FM05";                           // Change this
-uint8_t dbm = 10;
-uint8_t tx_buffer[SYMBOL_COUNT];
-
-boolean connected = false;
-volatile bool proceed = false;
-// NTP Servers:
-IPAddress timeServer(132, 163, 4, 101); // time-a.timefreq.bldrdoc.gov
-// IPAddress timeServer(132, 163, 4, 102); // time-b.timefreq.bldrdoc.gov
-// IPAddress timeServer(132, 163, 4, 103); // time-c.timefreq.bldrdoc.gov
-
-WiFiUDP udp;
-
-const int timeZone = -5;     // Central European Time
-//const int timeZone = -5;  // Eastern Standard Time (USA)
-//const int timeZone = -4;  // Eastern Daylight Time (USA)
-//const int timeZone = -8;  // Pacific Standard Time (USA)
-//const int timeZone = -7;  // Pacific Daylight Time (USA)
-
-void wspr_spacing()
-{
-  proceed = true;
+  // Sync TimeLib with system time
+  setSyncProvider([]() { return time(nullptr); });
+  setSyncInterval(300);
 }
 
-unsigned int localPort = 8888;  // local port to listen for UDP packets
+// -------------------- Setup --------------------
+void setup() {
+  Serial.begin(115200);
+  delay(50);
 
-void setup()
-{
-
-  Serial.begin(9600);
-
-  while (!Serial) ; // Needed for Leonardo only
-  delay(250);
-
-  connectToWiFi(networkName, networkPswd);
-
-  Serial.println("waiting for sync");
-  delay(10000);
-  setSyncProvider(getNtpTime);
-  setSyncInterval(300000); //Bogus interval, we will reset later
-  delay(5000);
-  // Initialize the Si5351
-  // Change the 2nd parameter in init if using a ref osc other
-  // than 25 MHz
-
-
-
-
-  if (clockgen.begin() != ERROR_NONE)
-  {
-    /* There was a problem detecting the IC ... check your connections */
-    Serial.print("Ooops, no Si5351 detected ... Check your wiring or I2C ADDR!");
-    while (1);
+  // --- WiFi connection ---
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, pass);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(200);
+    Serial.print(".");
   }
-  Serial.println("OK!");
-  delay(5000);
-  si5351aSetFrequency(freq);
-  clockgen.enableOutputs(false);
+  Serial.println("\nWiFi OK: " + WiFi.localIP().toString());
 
-  Wire.beginTransmission(0x60);
-  Wire.write(16);
-  Wire.write(0x03 & 0xFF);
-  Wire.endTransmission();
+  setupTime();
 
+  // --- I2C initialization ---
+  Wire.begin(21, 22);           // SDA=21, SCL=22 (ESP32 DevKit)
+  Wire.setClock(400000);
 
-
-  timer = timerBegin(3, 80, 1);
-  timerAttachInterrupt(timer, &wspr_spacing, 1);
-  timerAlarmWrite(timer, 682687, true);
-  timerAlarmEnable(timer);
-  Serial.print(hour());
-  Serial.print(":");
-  Serial.print(minute());
-  Serial.print(":");
-
-  Serial.println(second());
-}
-
-
-void loop()
-{
-
-  if (timeStatus() == timeSet && minute() % 4 == 0 && second() == 0)
-  {
-    setSyncInterval(180); ///reset sync time to prevent interuption of beacon
-    delay(1000);
-    encode();
-    delay(1000);
-  }
-  delay(1000);
-}
-
-
-
-/*-------- NTP code ----------*/
-
-const int NTP_PACKET_SIZE = 48; // NTP time is in the first 48 bytes of message
-byte packetBuffer[NTP_PACKET_SIZE]; //buffer to hold incoming & outgoing packets
-
-time_t getNtpTime()
-{
-  while (udp.parsePacket() > 0) ; // discard any previously received packets
-  Serial.println("Transmit NTP Request");
-  sendNTPpacket(timeServer);
-  uint32_t beginWait = millis();
-  while (millis() - beginWait < 1500) {
-    int size = udp.parsePacket();
-    if (size >= NTP_PACKET_SIZE) {
-      Serial.println("Receive NTP Response");
-      udp.read(packetBuffer, NTP_PACKET_SIZE);  // read packet into the buffer
-      unsigned long secsSince1900;
-      // convert four bytes starting at location 40 to a long integer
-      secsSince1900 =  (unsigned long)packetBuffer[40] << 24;
-      secsSince1900 |= (unsigned long)packetBuffer[41] << 16;
-      secsSince1900 |= (unsigned long)packetBuffer[42] << 8;
-      secsSince1900 |= (unsigned long)packetBuffer[43];
-      return secsSince1900 - 2208988800UL + timeZone * SECS_PER_HOUR;
-    }
-  }
-  Serial.println("No NTP Response :-(");
-  return 0; // return 0 if unable to get the time
-}
-
-// send an NTP request to the time server at the given address
-void sendNTPpacket(IPAddress &address)
-{
-  // set all bytes in the buffer to 0
-  memset(packetBuffer, 0, NTP_PACKET_SIZE);
-  // Initialize values needed to form NTP request
-  // (see URL above for details on the packets)
-  packetBuffer[0] = 0b11100011;   // LI, Version, Mode
-  packetBuffer[1] = 0;     // Stratum, or type of clock
-  packetBuffer[2] = 6;     // Polling Interval
-  packetBuffer[3] = 0xEC;  // Peer Clock Precision
-  // 8 bytes of zero for Root Delay & Root Dispersion
-  packetBuffer[12]  = 49;
-  packetBuffer[13]  = 0x4E;
-  packetBuffer[14]  = 49;
-  packetBuffer[15]  = 52;
-  // all NTP fields have been given values, now
-  // you can send a packet requesting a timestamp:
-  udp.beginPacket(address, 123); //NTP requests are to port 123
-  udp.write(packetBuffer, NTP_PACKET_SIZE);
-  udp.endPacket();
-}
-
-void connectToWiFi(const char * ssid, const char * pwd) {
-  Serial.println("Connecting to WiFi network: " + String(ssid));
-
-  // delete old config
-  WiFi.disconnect(true);
-  //register event handler
-  WiFi.onEvent(WiFiEvent);
-
-  //Initiate connection
-  WiFi.begin(ssid, pwd);
-
-  Serial.println("Waiting for WIFI connection...");
-}
-
-//wifi event handler
-void WiFiEvent(WiFiEvent_t event) {
-  switch (event) {
-    case SYSTEM_EVENT_STA_GOT_IP:
-      //When connected set
-      Serial.print("WiFi connected! IP address: ");
-      Serial.println(WiFi.localIP());
-      //initializes the UDP state
-      //This initializes the transfer buffer
-      udp.begin(WiFi.localIP(), localPort);
-      connected = true;
-      break;
-    case SYSTEM_EVENT_STA_DISCONNECTED:
-      Serial.println("WiFi lost connection");
-      connected = false;
-      break;
-  }
-}
-
-void encode()
-{
-  uint8_t i;
-  Serial.println("Sending Beacon");
-  jtencode.wspr_encode(call, loc, dbm, tx_buffer);
-
-  // Reset the tone to 0 and turn on the output
-  Wire.beginTransmission(0x60);
-  Wire.write(3);
-  Wire.write(0xfe & 0xFF);
-  Wire.endTransmission();
-
-
-  // Now do the rest of the message
-  for (i = 0; i < SYMBOL_COUNT; i++)
-  {
-    si5351aSetFrequency((freq) + (tx_buffer[i] * TONE_SPACING));
-    proceed = false;
-    while (!proceed);
+  // --- Si5351 setup ---
+  if (!si5351.init(SI5351_CRYSTAL_LOAD_8PF, 0, 0)) {
+    Serial.println("Si5351 init FAILED!");
+    while (true) delay(1000);
   }
 
-  // Turn off the output
-  Wire.beginTransmission(0x60);
-  Wire.write(3);
-  Wire.write(0xFF & 0xFF);
-  Wire.endTransmission();
-  Serial.println();
-  Serial.println("Beacon Sent");
+  // Optional: Si5351 crystal correction (in ppb)
+  // si5351.set_correction(ppb_value, SI5351_PLL_INPUT_XO);
 
+  si5351.drive_strength(SI5351_CLK0, SI5351_DRIVE_8MA);
+  si5351.set_clock_pwr(SI5351_CLK0, 0); // Start with output off
+
+  // --- Hardware timer ---
+  tmr = timerBegin(1000000);             // 1 MHz base (ticks in microseconds)
+  timerAttachInterrupt(tmr, &onTick);
+  timerAlarm(tmr, SYM_US, true, 0);      // 0.682687 s periodic interrupt
+
+  Serial.println("Setup complete.");
 }
 
-void si5351aSetFrequency(uint32_t frequency)
-{
-  uint32_t pllFreq;
-  uint32_t xtalFreq = 25000000;
-  uint32_t l;
-  float f;
-  uint8_t mult;
-  uint32_t num;
-  uint32_t denom;
-  uint32_t divider;
-
-  divider = 50;// Force MultiSynth divider to 50 for reduced jitter
-  
-  pllFreq = divider * frequency;  // Calculate the pllFrequency: the divider * desired output frequency
-
-  mult = pllFreq / xtalFreq;    // Determine the multiplier to get to the required pllFrequency
-  l = pllFreq % xtalFreq;     // It has three parts:
-  f = l;              // mult is an integer that must be in the range 15..90
-  f *= 200000;         // num and denom are the fractional parts, the numerator and denominator
-  f /= xtalFreq;          // each is 20 bits (range 0..1048575)
-  num = f;            // the actual multiplier is  mult + num / denom
-  denom = 200000;       
-
- 
-  clockgen.setupPLL(SI5351_PLL_A, mult, num, denom);
-  clockgen.setupMultisynth(0, SI5351_PLL_A, divider, 0, 1);
+// -------------------- Helpers --------------------
+uint64_t base_chz() {
+  uint64_t hz = (uint64_t)DIAL_20M_HZ + (int32_t)CORRECTION_HZ;
+  return hz * 100ULL; // Convert to centi-Hz for Si5351 library
 }
 
+void start_warmup() {
+  // Enable Si5351 output 30 s before the TX slot
+  si5351.set_freq(base_chz(), SI5351_CLK0);
+  si5351.set_clock_pwr(SI5351_CLK0, 1);
+  warmed_up = true;
+  Serial.println("Warm-up started (30 s before TX)");
+}
 
+void stop_output() {
+  si5351.set_clock_pwr(SI5351_CLK0, 0);
+}
+
+// -------------------- WSPR Transmission --------------------
+void wspr_tx() {
+  jt.wspr_encode(call, loc, dbm, txbuf);
+
+  if (!warmed_up) {
+    si5351.set_freq(base_chz(), SI5351_CLK0);
+    si5351.set_clock_pwr(SI5351_CLK0, 1);
+  }
+
+  Serial.println("TX START");
+  uint32_t t0 = millis();
+
+  for (uint16_t i = 0; i < SYMBOL_COUNT; i++) {
+    uint64_t f_chz = base_chz() + (uint64_t)txbuf[i] * TONE_SPACING_CHZ;
+    si5351.set_freq(f_chz, SI5351_CLK0);
+    tick = false;
+    while (!tick) { /* wait for next 0.682687 s symbol */ }
+  }
+
+  stop_output();
+  warmed_up = false;
+
+  uint32_t dt = millis() - t0;
+  Serial.printf("TX END (duration %lu ms)\n", (unsigned long)dt);
+}
+
+// -------------------- Main Loop --------------------
+void loop() {
+  if (timeStatus() != timeSet) { delay(200); return; }
+
+  // Start warm-up exactly 30 s before an even minute slot
+  if (!warmed_up && (minute() % 2 == 1) && (second() == 30)) {
+    start_warmup();
+  }
+
+  // Start WSPR transmission exactly on even minute, second 00
+  if ((minute() % 2 == 0) && (second() == 0)) {
+    delay(5); // debounce
+    if (second() <= 1) wspr_tx();
+  }
+
+  delay(20);
+}
